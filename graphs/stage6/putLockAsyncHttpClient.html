@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>Flame Graph</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas' style='width: 100%; height: 928px'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(58);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0x50e150, 30, 30, 30],
+		[0x50bebe, 30, 30, 30],
+		[0xe17d00, 30, 30,  0],
+		[0xc8c83c, 30, 30, 10],
+		[0xe15a5a, 30, 40, 40],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			for (let x in marked) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			}
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+f(0,0,3527502,4,'all')
+f(1,0,2990607,0,'java/lang/Thread.run')
+f(2,0,2990607,0,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(3,0,2990607,0,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(4,0,956478,0,'java/util/concurrent/CompletableFuture$AsyncSupply.run')
+f(5,0,956478,0,'java/util/concurrent/CompletableFuture.postComplete')
+f(6,0,956478,0,'java/util/concurrent/CompletableFuture$UniCompose.tryFire')
+f(7,0,952154,0,'jdk/internal/net/http/MultiExchange$$Lambda$202/776553710.apply')
+f(8,0,952154,0,'jdk/internal/net/http/MultiExchange.lambda$responseAsync0$2')
+f(9,0,952154,0,'jdk/internal/net/http/MultiExchange.responseAsyncImpl')
+f(10,0,1,0,'java/util/concurrent/CompletableFuture.handle')
+f(11,0,1,0,'java/util/concurrent/CompletableFuture.uniHandleStage')
+f(12,0,1,0,'java/util/concurrent/CompletableFuture.uniHandle')
+f(13,0,1,0,'jdk/internal/net/http/MultiExchange$$Lambda$389/836453362.apply')
+f(14,0,1,0,'jdk/internal/net/http/MultiExchange.lambda$responseAsyncImpl$7')
+f(15,0,1,0,'jdk/internal/net/http/MultiExchange.cancelTimer')
+f(16,0,1,0,'jdk/internal/net/http/HttpClientImpl.cancelTimer')
+f(17,0,1,1,'jdk.internal.net.http.HttpClientImpl')
+f(10,1,784147,0,'jdk/internal/net/http/Exchange.responseAsync')
+f(11,1,784147,0,'jdk/internal/net/http/Exchange.responseAsyncImpl')
+f(12,1,784147,0,'jdk/internal/net/http/Exchange.responseAsyncImpl0')
+f(13,1,702558,0,'java/util/concurrent/CompletableFuture.handle')
+f(14,1,702558,0,'java/util/concurrent/CompletableFuture.uniHandleStage')
+f(15,1,702558,0,'java/util/concurrent/CompletableFuture.uniHandle')
+f(16,1,702558,0,'jdk/internal/net/http/Exchange$$Lambda$335/1431990550.apply')
+f(17,1,702558,0,'jdk/internal/net/http/Exchange.lambda$responseAsyncImpl0$9')
+f(18,1,702558,0,'jdk/internal/net/http/Exchange.checkFor407')
+f(19,1,702558,0,'jdk/internal/net/http/Exchange$$Lambda$235/847031536.apply')
+f(20,1,702558,0,'jdk/internal/net/http/Exchange.lambda$responseAsyncImpl0$8')
+f(21,1,702558,0,'jdk/internal/net/http/Http1Exchange.sendHeadersAsync')
+f(22,1,702558,0,'java/util/concurrent/CompletableFuture.thenCompose')
+f(23,1,702558,0,'java/util/concurrent/CompletableFuture.uniComposeStage')
+f(24,1,702558,0,'jdk/internal/net/http/Http1Exchange$$Lambda$384/1040773922.apply')
+f(25,1,702558,0,'jdk/internal/net/http/Http1Exchange.lambda$sendHeadersAsync$4')
+f(26,1,702558,0,'jdk/internal/net/http/Http1Exchange.connectFlows')
+f(27,1,702558,0,'jdk/internal/net/http/SocketTube.connectFlows')
+f(28,1,56067,0,'jdk/internal/net/http/Http1Exchange$Http1Publisher.subscribe')
+f(29,1,56067,0,'jdk/internal/net/http/SocketTube.onSubscribe')
+f(30,1,56067,0,'jdk/internal/net/http/SocketTube$InternalWriteSubscriber.onSubscribe')
+f(31,1,56067,0,'jdk/internal/net/http/HttpClientImpl.registerEvent')
+f(32,1,56067,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.register')
+f(33,1,45351,1,'jdk.internal.net.http.HttpClientImpl$SelectorManager')
+f(33,45352,10716,0,'sun/nio/ch/EPollSelectorImpl.wakeup')
+f(34,45352,10716,1,'java.lang.Object')
+f(28,56068,646491,0,'jdk/internal/net/http/SocketTube.subscribe')
+f(29,56068,646491,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher.subscribe')
+f(30,56068,646491,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.signalSubscribe')
+f(31,56068,646491,0,'jdk/internal/net/http/HttpClientImpl.registerEvent')
+f(32,56068,646491,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.register')
+f(33,56068,627347,1,'jdk.internal.net.http.HttpClientImpl$SelectorManager')
+f(33,683415,19144,0,'sun/nio/ch/EPollSelectorImpl.wakeup')
+f(34,683415,19144,1,'java.lang.Object')
+f(13,702559,81589,0,'jdk/internal/net/http/Exchange.establishExchange')
+f(14,702559,81589,0,'jdk/internal/net/http/ExchangeImpl.get')
+f(15,702559,81589,0,'jdk/internal/net/http/ExchangeImpl.createHttp1Exchange')
+f(16,702559,81589,0,'jdk/internal/net/http/Http1Exchange.<init>')
+f(17,702559,81578,0,'jdk/internal/net/http/HttpConnection.getConnection')
+f(18,702559,81578,0,'jdk/internal/net/http/ConnectionPool.getConnection')
+f(19,702559,81578,1,'jdk.internal.net.http.ConnectionPool')
+f(17,784137,11,0,'jdk/internal/net/http/HttpRequestImpl.getAddress')
+f(18,784137,11,0,'java/security/AccessController.doPrivileged')
+f(19,784137,11,0,'jdk/internal/net/http/HttpRequestImpl$$Lambda$252/112419041.run')
+f(20,784137,11,0,'jdk/internal/net/http/HttpRequestImpl.lambda$getAddress$5')
+f(21,784137,11,0,'java/net/InetSocketAddress.<init>')
+f(22,784137,11,0,'java/net/InetAddress.getByName')
+f(23,784137,11,0,'java/net/InetAddress.getAllByName')
+f(24,784137,11,0,'java/net/InetAddress.getAllByName')
+f(25,784137,11,0,'java/net/InetAddress.getAllByName0')
+f(26,784137,11,0,'java/net/InetAddress$NameServiceAddresses.get')
+f(27,784137,11,1,'java.net.InetAddress$NameServiceAddresses')
+f(10,784148,154785,0,'jdk/internal/net/http/HttpClientImpl.registerTimer')
+f(11,784148,115413,1,'jdk.internal.net.http.HttpClientImpl')
+f(11,899561,39372,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.wakeupSelector')
+f(12,899561,39372,0,'sun/nio/ch/EPollSelectorImpl.wakeup')
+f(13,899561,39372,1,'java.lang.Object')
+f(10,938933,13221,0,'jdk/internal/net/http/MultiExchange.requestFilters')
+f(11,938933,13221,0,'jdk/internal/net/http/AuthenticationFilter.request')
+f(12,938933,317,0,'jdk/internal/net/http/AuthenticationFilter$Cache.get')
+f(13,938933,317,1,'jdk.internal.net.http.AuthenticationFilter$Cache')
+f(12,939250,12904,0,'jdk/internal/net/http/AuthenticationFilter.getCache')
+f(13,939250,12904,1,'java.lang.Class')
+f(7,952154,4324,0,'ru/mail/polis/service/igorsamokhin/ProxyClient$$Lambda$165/880878335.apply')
+f(8,952154,4324,0,'ru/mail/polis/service/igorsamokhin/ProxyClient.lambda$sendAsync$2')
+f(9,952154,4324,0,'jdk/internal/net/http/HttpClientFacade.sendAsync')
+f(10,952154,4324,0,'jdk/internal/net/http/HttpClientImpl.sendAsync')
+f(11,952154,4324,0,'jdk/internal/net/http/HttpClientImpl.sendAsync')
+f(12,952154,4324,0,'jdk/internal/net/http/HttpClientImpl.sendAsync')
+f(13,952154,4324,0,'jdk/internal/net/http/MultiExchange.responseAsync')
+f(14,952154,4324,0,'java/util/concurrent/CompletableFuture.completeAsync')
+f(15,952154,4324,0,'java/util/concurrent/ThreadPoolExecutor.execute')
+f(16,952154,4324,0,'java/util/concurrent/LinkedBlockingQueue.offer')
+f(17,952154,1815,0,'java/util/concurrent/LinkedBlockingQueue.signalNotEmpty')
+f(18,952154,1815,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(19,952154,1815,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(20,952154,1815,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(21,952154,1815,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(22,952154,1815,0,'java/util/concurrent/locks/LockSupport.park')
+f(23,952154,1815,0,'jdk/internal/misc/Unsafe.park')
+f(24,952154,1815,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(17,953969,2509,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(18,953969,2509,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(19,953969,2509,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(20,953969,2509,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(21,953969,2509,0,'java/util/concurrent/locks/LockSupport.park')
+f(22,953969,2509,0,'jdk/internal/misc/Unsafe.park')
+f(23,953969,2509,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(4,956478,155057,0,'java/util/concurrent/ThreadPoolExecutor.getTask')
+f(5,956478,155057,0,'java/util/concurrent/LinkedBlockingQueue.take')
+f(6,956478,17789,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject.await')
+f(7,956478,17789,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(8,956478,17789,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(9,956478,17789,0,'java/util/concurrent/locks/LockSupport.park')
+f(10,956478,17789,0,'jdk/internal/misc/Unsafe.park')
+f(11,956478,17789,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(6,974267,137268,0,'java/util/concurrent/locks/ReentrantLock.lockInterruptibly')
+f(7,974267,137268,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireInterruptibly')
+f(8,974267,137268,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.doAcquireInterruptibly')
+f(9,974267,137268,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(10,974267,137268,0,'java/util/concurrent/locks/LockSupport.park')
+f(11,974267,137268,0,'jdk/internal/misc/Unsafe.park')
+f(12,974267,137268,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(4,1111535,1070,0,'jdk/internal/net/http/SocketTube$InternalWriteSubscriber$$Lambda$398/450776934.run')
+f(5,1111535,1070,0,'jdk/internal/net/http/SocketTube$InternalWriteSubscriber.requestMore')
+f(6,1111535,1070,0,'jdk/internal/net/http/SocketTube$InternalWriteSubscriber$WriteSubscription.requestMore')
+f(7,1111535,1070,0,'jdk/internal/net/http/Http1Exchange$Http1Publisher$Http1WriteSubscription.request')
+f(8,1111535,1070,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(9,1111535,1070,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(10,1111535,1070,0,'jdk/internal/net/http/HttpClientImpl$DelegatingExecutor.execute')
+f(11,1111535,1070,0,'jdk/internal/net/http/common/SequentialScheduler$SchedulableTask.run')
+f(12,1111535,1070,0,'jdk/internal/net/http/common/SequentialScheduler$CompleteRestartableTask.run')
+f(13,1111535,1070,0,'jdk/internal/net/http/common/SequentialScheduler$SynchronizedRestartableTask.run')
+f(14,1111535,1070,0,'jdk/internal/net/http/Http1Exchange$Http1Publisher$WriteTask.run')
+f(15,1111535,1070,0,'jdk/internal/net/http/Http1Exchange.getOutgoing')
+f(16,1111535,1070,0,'java/util/concurrent/CompletableFuture.completeAsync')
+f(17,1111535,1070,0,'jdk/internal/net/http/HttpClientImpl$DelegatingExecutor.execute')
+f(18,1111535,1070,0,'java/util/concurrent/CompletableFuture$AsyncSupply.run')
+f(19,1111535,1070,0,'java/util/concurrent/CompletableFuture.postComplete')
+f(20,1111535,906,0,'java/util/concurrent/CompletableFuture$UniCompose.tryFire')
+f(21,1111535,1,0,'java/util/concurrent/CompletableFuture.unipush')
+f(22,1111535,1,0,'java/util/concurrent/CompletableFuture$UniRelay.tryFire')
+f(23,1111535,1,0,'java/util/concurrent/CompletableFuture.postFire')
+f(24,1111535,1,0,'java/util/concurrent/CompletableFuture.postComplete')
+f(25,1111535,1,0,'java/util/concurrent/CompletableFuture$UniCompose.tryFire')
+f(26,1111535,1,0,'jdk/internal/net/http/MultiExchange$$Lambda$207/1268094944.apply')
+f(27,1111535,1,0,'jdk/internal/net/http/MultiExchange.lambda$responseAsync0$4')
+f(28,1111535,1,0,'jdk/internal/net/http/Exchange.readBodyAsync')
+f(29,1111535,1,0,'jdk/internal/net/http/Http1Exchange.readBodyAsync')
+f(30,1111535,1,0,'jdk/internal/net/http/Http1Response.readBody')
+f(31,1111535,1,0,'jdk/internal/net/http/HttpClientImpl$DelegatingExecutor.execute')
+f(32,1111535,1,0,'jdk/internal/net/http/Http1Response$$Lambda$447/744824739.run')
+f(33,1111535,1,0,'jdk/internal/net/http/Http1Response.lambda$readBody$3')
+f(34,1111535,1,0,'jdk/internal/net/http/Http1AsyncReceiver.subscribe')
+f(35,1111535,1,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(36,1111535,1,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(37,1111535,1,0,'jdk/internal/net/http/common/SequentialScheduler$SchedulableTask.run')
+f(38,1111535,1,0,'jdk/internal/net/http/common/SequentialScheduler$CompleteRestartableTask.run')
+f(39,1111535,1,0,'jdk/internal/net/http/common/SequentialScheduler$SynchronizedRestartableTask.run')
+f(40,1111535,1,0,'jdk/internal/net/http/Http1AsyncReceiver$$Lambda$319/1600113763.run')
+f(41,1111535,1,0,'jdk/internal/net/http/Http1AsyncReceiver.flush')
+f(42,1111535,1,0,'jdk/internal/net/http/Http1AsyncReceiver.handlePendingDelegate')
+f(43,1111535,1,0,'jdk/internal/net/http/Http1Response$BodyReader.onSubscribe')
+f(44,1111535,1,0,'jdk/internal/net/http/ResponseContent$FixedLengthBodyParser.onSubscribe')
+f(45,1111535,1,0,'jdk/internal/net/http/Http1Response$$Lambda$448/1925451802.run')
+f(46,1111535,1,0,'jdk/internal/net/http/Http1Response.onFinished')
+f(47,1111535,1,0,'jdk/internal/net/http/HttpConnection.closeOrReturnToCache')
+f(48,1111535,1,0,'jdk/internal/net/http/ConnectionPool.returnToPool')
+f(49,1111535,1,0,'jdk/internal/net/http/ConnectionPool.returnToPool')
+f(50,1111535,1,0,'jdk/internal/net/http/ConnectionPool.registerCleanupTrigger')
+f(51,1111535,1,0,'jdk/internal/net/http/SocketTube.connectFlows')
+f(52,1111535,1,0,'jdk/internal/net/http/SocketTube.subscribe')
+f(53,1111535,1,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher.subscribe')
+f(54,1111535,1,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.signalSubscribe')
+f(55,1111535,1,0,'jdk/internal/net/http/HttpClientImpl.registerEvent')
+f(56,1111535,1,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.register')
+f(57,1111535,1,1,'jdk.internal.net.http.HttpClientImpl$SelectorManager')
+f(21,1111536,882,0,'jdk/internal/net/http/MultiExchange$$Lambda$207/1268094944.apply')
+f(22,1111536,882,0,'jdk/internal/net/http/MultiExchange.lambda$responseAsync0$4')
+f(23,1111536,882,0,'jdk/internal/net/http/Exchange.readBodyAsync')
+f(24,1111536,882,0,'jdk/internal/net/http/Http1Exchange.readBodyAsync')
+f(25,1111536,882,0,'jdk/internal/net/http/Http1Response.readBody')
+f(26,1111536,882,0,'jdk/internal/net/http/HttpClientImpl$DelegatingExecutor.execute')
+f(27,1111536,882,0,'jdk/internal/net/http/Http1Response$$Lambda$447/744824739.run')
+f(28,1111536,882,0,'jdk/internal/net/http/Http1Response.lambda$readBody$3')
+f(29,1111536,882,0,'jdk/internal/net/http/Http1AsyncReceiver.subscribe')
+f(30,1111536,882,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(31,1111536,882,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(32,1111536,882,0,'jdk/internal/net/http/common/SequentialScheduler$SchedulableTask.run')
+f(33,1111536,882,0,'jdk/internal/net/http/common/SequentialScheduler$CompleteRestartableTask.run')
+f(34,1111536,882,0,'jdk/internal/net/http/common/SequentialScheduler$SynchronizedRestartableTask.run')
+f(35,1111536,882,0,'jdk/internal/net/http/Http1AsyncReceiver$$Lambda$319/1600113763.run')
+f(36,1111536,882,0,'jdk/internal/net/http/Http1AsyncReceiver.flush')
+f(37,1111536,882,0,'jdk/internal/net/http/Http1AsyncReceiver.handlePendingDelegate')
+f(38,1111536,882,0,'jdk/internal/net/http/Http1Response$BodyReader.onSubscribe')
+f(39,1111536,882,0,'jdk/internal/net/http/ResponseContent$FixedLengthBodyParser.onSubscribe')
+f(40,1111536,882,0,'jdk/internal/net/http/Http1Response$$Lambda$448/1925451802.run')
+f(41,1111536,882,0,'jdk/internal/net/http/Http1Response.onFinished')
+f(42,1111536,882,0,'jdk/internal/net/http/HttpConnection.closeOrReturnToCache')
+f(43,1111536,882,0,'jdk/internal/net/http/ConnectionPool.returnToPool')
+f(44,1111536,882,0,'jdk/internal/net/http/ConnectionPool.returnToPool')
+f(45,1111536,101,1,'jdk.internal.net.http.ConnectionPool')
+f(45,1111637,781,0,'jdk/internal/net/http/ConnectionPool.registerCleanupTrigger')
+f(46,1111637,781,0,'jdk/internal/net/http/SocketTube.connectFlows')
+f(47,1111637,64,0,'jdk/internal/net/http/ConnectionPool$CleanupTrigger.subscribe')
+f(48,1111637,64,0,'jdk/internal/net/http/SocketTube.onSubscribe')
+f(49,1111637,64,0,'jdk/internal/net/http/SocketTube$InternalWriteSubscriber.onSubscribe')
+f(50,1111637,64,0,'jdk/internal/net/http/HttpClientImpl.registerEvent')
+f(51,1111637,64,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.register')
+f(52,1111637,48,1,'jdk.internal.net.http.HttpClientImpl$SelectorManager')
+f(52,1111685,16,0,'sun/nio/ch/EPollSelectorImpl.wakeup')
+f(53,1111685,16,1,'java.lang.Object')
+f(47,1111701,717,0,'jdk/internal/net/http/SocketTube.subscribe')
+f(48,1111701,717,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher.subscribe')
+f(49,1111701,717,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.signalSubscribe')
+f(50,1111701,717,0,'jdk/internal/net/http/HttpClientImpl.registerEvent')
+f(51,1111701,717,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.register')
+f(52,1111701,699,1,'jdk.internal.net.http.HttpClientImpl$SelectorManager')
+f(52,1112400,18,0,'sun/nio/ch/EPollSelectorImpl.wakeup')
+f(53,1112400,18,1,'java.lang.Object')
+f(21,1112418,23,0,'jdk/internal/net/http/MultiExchange$$Lambda$388/1017120636.apply')
+f(22,1112418,23,0,'jdk/internal/net/http/MultiExchange.lambda$responseAsyncImpl$6')
+f(23,1112418,23,0,'jdk/internal/net/http/MultiExchange.responseFilters')
+f(24,1112418,23,0,'jdk/internal/net/http/AuthenticationFilter.response')
+f(25,1112418,23,0,'jdk/internal/net/http/AuthenticationFilter.getCache')
+f(26,1112418,23,1,'java.lang.Class')
+f(20,1112441,164,0,'java/util/concurrent/CompletableFuture$UniHandle.tryFire')
+f(21,1112441,164,0,'java/util/concurrent/CompletableFuture.uniHandle')
+f(22,1112441,164,0,'jdk/internal/net/http/MultiExchange$$Lambda$389/836453362.apply')
+f(23,1112441,164,0,'jdk/internal/net/http/MultiExchange.lambda$responseAsyncImpl$7')
+f(24,1112441,164,0,'jdk/internal/net/http/MultiExchange.cancelTimer')
+f(25,1112441,164,0,'jdk/internal/net/http/HttpClientImpl.cancelTimer')
+f(26,1112441,164,1,'jdk.internal.net.http.HttpClientImpl')
+f(4,1112605,1810416,0,'jdk/internal/net/http/common/SequentialScheduler$SchedulableTask.run')
+f(5,1112605,1810416,0,'jdk/internal/net/http/common/SequentialScheduler$CompleteRestartableTask.run')
+f(6,1112605,743868,0,'jdk/internal/net/http/common/SequentialScheduler$SynchronizedRestartableTask.run')
+f(7,1112605,743868,0,'jdk/internal/net/http/Http1AsyncReceiver$$Lambda$319/1600113763.run')
+f(8,1112605,743868,0,'jdk/internal/net/http/Http1AsyncReceiver.flush')
+f(9,1112605,664102,0,'jdk/internal/net/http/Http1AsyncReceiver.checkRequestMore')
+f(10,1112605,664102,0,'jdk/internal/net/http/Http1AsyncReceiver$Http1TubeSubscriber.requestMore')
+f(11,1112605,664102,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$ReadSubscription.request')
+f(12,1112605,664102,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.request')
+f(13,1112605,664102,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.resumeReadEvent')
+f(14,1112605,664102,0,'jdk/internal/net/http/SocketTube.resumeEvent')
+f(15,1112605,664102,0,'jdk/internal/net/http/HttpClientImpl.eventUpdated')
+f(16,1112605,664102,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.eventUpdated')
+f(17,1112605,664102,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.register')
+f(18,1112605,635219,1,'jdk.internal.net.http.HttpClientImpl$SelectorManager')
+f(18,1747824,28883,0,'sun/nio/ch/EPollSelectorImpl.wakeup')
+f(19,1747824,28883,1,'java.lang.Object')
+f(9,1776707,79766,0,'jdk/internal/net/http/Http1Response$HeadersReader.tryAsyncReceive')
+f(10,1776707,79766,0,'jdk/internal/net/http/Http1Response$Receiver.accept')
+f(11,1776707,79766,0,'jdk/internal/net/http/Http1Response$HeadersReader.handle')
+f(12,1776707,79766,0,'jdk/internal/net/http/Http1Response$HeadersReader.handle')
+f(13,1776707,79766,0,'java/util/concurrent/CompletableFuture.complete')
+f(14,1776707,79766,0,'java/util/concurrent/CompletableFuture.postComplete')
+f(15,1776707,79766,0,'java/util/concurrent/CompletableFuture$UniApply.tryFire')
+f(16,1776707,79766,0,'java/util/concurrent/CompletableFuture$UniCompletion.claim')
+f(17,1776707,79766,0,'jdk/internal/net/http/HttpClientImpl$DelegatingExecutor.execute')
+f(18,1776707,79766,0,'java/util/concurrent/CompletableFuture$Completion.run')
+f(19,1776707,79766,0,'java/util/concurrent/CompletableFuture$UniApply.tryFire')
+f(20,1776707,79766,0,'java/util/concurrent/CompletableFuture.postFire')
+f(21,1776707,79766,0,'java/util/concurrent/CompletableFuture.postComplete')
+f(22,1776707,14129,0,'java/util/concurrent/CompletableFuture$UniCompose.tryFire')
+f(23,1776707,14129,0,'jdk/internal/net/http/MultiExchange$$Lambda$388/1017120636.apply')
+f(24,1776707,14129,0,'jdk/internal/net/http/MultiExchange.lambda$responseAsyncImpl$6')
+f(25,1776707,14129,0,'jdk/internal/net/http/MultiExchange.responseFilters')
+f(26,1776707,14129,0,'jdk/internal/net/http/AuthenticationFilter.response')
+f(27,1776707,14129,0,'jdk/internal/net/http/AuthenticationFilter.getCache')
+f(28,1776707,14129,1,'java.lang.Class')
+f(22,1790836,65637,0,'java/util/concurrent/CompletableFuture$UniHandle.tryFire')
+f(23,1790836,65637,0,'java/util/concurrent/CompletableFuture.uniHandle')
+f(24,1790836,65637,0,'jdk/internal/net/http/MultiExchange$$Lambda$389/836453362.apply')
+f(25,1790836,65637,0,'jdk/internal/net/http/MultiExchange.lambda$responseAsyncImpl$7')
+f(26,1790836,65637,0,'jdk/internal/net/http/MultiExchange.cancelTimer')
+f(27,1790836,65637,0,'jdk/internal/net/http/HttpClientImpl.cancelTimer')
+f(28,1790836,65637,1,'jdk.internal.net.http.HttpClientImpl')
+f(6,1856473,1066548,0,'jdk/internal/net/http/common/SequentialScheduler$TryEndDeferredCompleter.complete')
+f(7,1856473,1066548,0,'jdk/internal/net/http/common/SequentialScheduler$CompleteRestartableTask.run')
+f(8,1856473,1066548,0,'jdk/internal/net/http/common/SequentialScheduler$SynchronizedRestartableTask.run')
+f(9,1856473,1066548,0,'jdk/internal/net/http/Http1AsyncReceiver$$Lambda$319/1600113763.run')
+f(10,1856473,1066548,0,'jdk/internal/net/http/Http1AsyncReceiver.flush')
+f(11,1856473,1060258,0,'jdk/internal/net/http/Http1AsyncReceiver.handlePendingDelegate')
+f(12,1856473,1060258,0,'jdk/internal/net/http/Http1Response$BodyReader.onSubscribe')
+f(13,1856473,1060258,0,'jdk/internal/net/http/ResponseContent$FixedLengthBodyParser.onSubscribe')
+f(14,1856473,1060258,0,'jdk/internal/net/http/Http1Response$$Lambda$448/1925451802.run')
+f(15,1856473,1060258,0,'jdk/internal/net/http/Http1Response.onFinished')
+f(16,1856473,1060258,0,'jdk/internal/net/http/HttpConnection.closeOrReturnToCache')
+f(17,1856473,1060258,0,'jdk/internal/net/http/ConnectionPool.returnToPool')
+f(18,1856473,1060258,0,'jdk/internal/net/http/ConnectionPool.returnToPool')
+f(19,1856473,88328,1,'jdk.internal.net.http.ConnectionPool')
+f(19,1944801,971930,0,'jdk/internal/net/http/ConnectionPool.registerCleanupTrigger')
+f(20,1944801,971930,0,'jdk/internal/net/http/SocketTube.connectFlows')
+f(21,1944801,90625,0,'jdk/internal/net/http/ConnectionPool$CleanupTrigger.subscribe')
+f(22,1944801,90625,0,'jdk/internal/net/http/SocketTube.onSubscribe')
+f(23,1944801,90625,0,'jdk/internal/net/http/SocketTube$InternalWriteSubscriber.onSubscribe')
+f(24,1944801,90625,0,'jdk/internal/net/http/HttpClientImpl.registerEvent')
+f(25,1944801,90625,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.register')
+f(26,1944801,74749,1,'jdk.internal.net.http.HttpClientImpl$SelectorManager')
+f(26,2019550,15876,0,'sun/nio/ch/EPollSelectorImpl.wakeup')
+f(27,2019550,15876,1,'java.lang.Object')
+f(21,2035426,881305,0,'jdk/internal/net/http/SocketTube.subscribe')
+f(22,2035426,881305,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher.subscribe')
+f(23,2035426,881305,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.signalSubscribe')
+f(24,2035426,881305,0,'jdk/internal/net/http/HttpClientImpl.registerEvent')
+f(25,2035426,881305,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.register')
+f(26,2035426,857198,1,'jdk.internal.net.http.HttpClientImpl$SelectorManager')
+f(26,2892624,24107,0,'sun/nio/ch/EPollSelectorImpl.wakeup')
+f(27,2892624,24107,1,'java.lang.Object')
+f(11,2916731,6290,0,'jdk/internal/net/http/Http1Response$HeadersReader.tryAsyncReceive')
+f(12,2916731,6290,0,'jdk/internal/net/http/Http1Response$Receiver.accept')
+f(13,2916731,6290,0,'jdk/internal/net/http/Http1Response$HeadersReader.handle')
+f(14,2916731,6290,0,'jdk/internal/net/http/Http1Response$HeadersReader.handle')
+f(15,2916731,6290,0,'java/util/concurrent/CompletableFuture.complete')
+f(16,2916731,6290,0,'java/util/concurrent/CompletableFuture.postComplete')
+f(17,2916731,6290,0,'java/util/concurrent/CompletableFuture$UniApply.tryFire')
+f(18,2916731,6290,0,'java/util/concurrent/CompletableFuture$UniCompletion.claim')
+f(19,2916731,6290,0,'jdk/internal/net/http/HttpClientImpl$DelegatingExecutor.execute')
+f(20,2916731,6290,0,'java/util/concurrent/CompletableFuture$Completion.run')
+f(21,2916731,6290,0,'java/util/concurrent/CompletableFuture$UniApply.tryFire')
+f(22,2916731,6290,0,'java/util/concurrent/CompletableFuture.postFire')
+f(23,2916731,6290,0,'java/util/concurrent/CompletableFuture.postComplete')
+f(24,2916731,740,0,'java/util/concurrent/CompletableFuture$UniCompose.tryFire')
+f(25,2916731,740,0,'jdk/internal/net/http/MultiExchange$$Lambda$388/1017120636.apply')
+f(26,2916731,740,0,'jdk/internal/net/http/MultiExchange.lambda$responseAsyncImpl$6')
+f(27,2916731,740,0,'jdk/internal/net/http/MultiExchange.responseFilters')
+f(28,2916731,740,0,'jdk/internal/net/http/AuthenticationFilter.response')
+f(29,2916731,740,0,'jdk/internal/net/http/AuthenticationFilter.getCache')
+f(30,2916731,740,1,'java.lang.Class')
+f(24,2917471,5550,0,'java/util/concurrent/CompletableFuture$UniHandle.tryFire')
+f(25,2917471,5550,0,'java/util/concurrent/CompletableFuture.uniHandle')
+f(26,2917471,5550,0,'jdk/internal/net/http/MultiExchange$$Lambda$389/836453362.apply')
+f(27,2917471,5550,0,'jdk/internal/net/http/MultiExchange.lambda$responseAsyncImpl$7')
+f(28,2917471,5550,0,'jdk/internal/net/http/MultiExchange.cancelTimer')
+f(29,2917471,5550,0,'jdk/internal/net/http/HttpClientImpl.cancelTimer')
+f(30,2917471,5550,1,'jdk.internal.net.http.HttpClientImpl')
+f(4,2923021,6,0,'ru/mail/polis/lsm/igorsamokhin/LsmDAO$$Lambda$499/656052652.run')
+f(5,2923021,6,0,'ru/mail/polis/lsm/igorsamokhin/LsmDAO.lambda$upsert$0')
+f(6,2923021,6,0,'ru/mail/polis/lsm/igorsamokhin/LsmDAO.performCompactIfNeed')
+f(7,2923021,6,0,'ru/mail/polis/lsm/igorsamokhin/Storage.compactIterator')
+f(8,2923021,4,0,'ru/mail/polis/lsm/igorsamokhin/SSTable.range')
+f(9,2923021,2,1,'int[]')
+f(9,2923023,2,0,'java/lang/ClassLoader.loadClass')
+f(10,2923023,2,0,'jdk/internal/loader/ClassLoaders$AppClassLoader.loadClass')
+f(11,2923023,2,0,'jdk/internal/loader/BuiltinClassLoader.loadClass')
+f(12,2923023,2,0,'jdk/internal/loader/BuiltinClassLoader.loadClassOrNull')
+f(13,2923023,2,1,'java.lang.Object')
+f(8,2923025,2,0,'ru/mail/polis/lsm/igorsamokhin/Storage.merge')
+f(9,2923025,2,0,'ru/mail/polis/lsm/igorsamokhin/MergingIterator.<init>')
+f(10,2923025,2,0,'ru/mail/polis/lsm/igorsamokhin/ByteBufferRecordIterator.next')
+f(11,2923025,2,0,'ru/mail/polis/lsm/igorsamokhin/ByteBufferRecordIterator.next')
+f(12,2923025,2,0,'ru/mail/polis/lsm/igorsamokhin/LongMappedByteBuffer.getLong')
+f(13,2923025,2,0,'ru/mail/polis/lsm/igorsamokhin/LongMappedByteBuffer.getByteBufferToReadBytes')
+f(14,2923025,2,0,'ru/mail/polis/lsm/igorsamokhin/LongMappedByteBuffer.getIndexAndOffset')
+f(15,2923025,2,0,'java/lang/ClassLoader.loadClass')
+f(16,2923025,2,0,'jdk/internal/loader/ClassLoaders$AppClassLoader.loadClass')
+f(17,2923025,2,0,'jdk/internal/loader/BuiltinClassLoader.loadClass')
+f(18,2923025,2,0,'jdk/internal/loader/BuiltinClassLoader.loadClassOrNull')
+f(19,2923025,2,1,'java.lang.Object')
+f(4,2923027,67580,0,'ru/mail/polis/service/igorsamokhin/ServiceImpl$$Lambda$115/411621267.run')
+f(5,2923027,67580,0,'ru/mail/polis/service/igorsamokhin/ServiceImpl.lambda$entity$0')
+f(6,2923027,67580,0,'ru/mail/polis/service/igorsamokhin/ServiceImpl.task')
+f(7,2923027,4183,0,'ru/mail/polis/service/igorsamokhin/ProxyClient.proxy')
+f(8,2923027,4183,0,'ru/mail/polis/service/igorsamokhin/ResponseFuture.thenCompose')
+f(9,2923027,4183,0,'java/util/concurrent/CompletableFuture.completeAsync')
+f(10,2923027,4183,0,'java/util/concurrent/ThreadPoolExecutor.execute')
+f(11,2923027,4183,0,'java/util/concurrent/LinkedBlockingQueue.offer')
+f(12,2923027,1624,0,'java/util/concurrent/LinkedBlockingQueue.signalNotEmpty')
+f(13,2923027,1624,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(14,2923027,1624,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(15,2923027,1624,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(16,2923027,1624,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(17,2923027,1624,0,'java/util/concurrent/locks/LockSupport.park')
+f(18,2923027,1624,0,'jdk/internal/misc/Unsafe.park')
+f(19,2923027,1624,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(12,2924651,2559,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(13,2924651,2559,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(14,2924651,2559,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(15,2924651,2559,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(16,2924651,2559,0,'java/util/concurrent/locks/LockSupport.park')
+f(17,2924651,2559,0,'jdk/internal/misc/Unsafe.park')
+f(18,2924651,2559,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(7,2927210,63397,0,'ru/mail/polis/service/igorsamokhin/ServiceImpl.sendResponse')
+f(8,2927210,63397,0,'one/nio/http/HttpSession.sendResponse')
+f(9,2927210,63397,1,'one.nio.http.HttpSession')
+f(1,2990607,145,0,'java/util/concurrent/ForkJoinWorkerThread.run')
+f(2,2990607,145,0,'java/util/concurrent/ForkJoinPool.runWorker')
+f(3,2990607,145,0,'java/util/concurrent/ForkJoinPool.scan')
+f(4,2990607,145,0,'java/util/concurrent/ForkJoinPool$WorkQueue.topLevelExec')
+f(5,2990607,145,0,'java/util/concurrent/ForkJoinTask.doExec')
+f(6,2990607,145,0,'java/util/concurrent/CompletableFuture$Completion.exec')
+f(7,2990607,145,0,'java/util/concurrent/CompletableFuture$UniWhenComplete.tryFire')
+f(8,2990607,145,0,'java/util/concurrent/CompletableFuture.postFire')
+f(9,2990607,145,0,'java/util/concurrent/CompletableFuture.postComplete')
+f(10,2990607,145,0,'java/util/concurrent/CompletableFuture$UniApply.tryFire')
+f(11,2990607,145,0,'ru/mail/polis/service/igorsamokhin/ResponseFuture$$Lambda$171/1015859649.apply')
+f(12,2990607,145,0,'ru/mail/polis/service/igorsamokhin/ResponseFuture.lambda$thenCompose$0')
+f(13,2990607,145,0,'ru/mail/polis/service/igorsamokhin/ProxyClient$$Lambda$147/1321025816.run')
+f(14,2990607,145,0,'ru/mail/polis/service/igorsamokhin/ProxyClient.lambda$proxy$0')
+f(15,2990607,145,0,'java/util/concurrent/CopyOnWriteArrayList.add')
+f(16,2990607,145,1,'java.lang.Object')
+f(1,2990752,532540,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.run')
+f(2,2990752,669,0,'java/util/ArrayList.forEach')
+f(3,2990752,669,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager$$Lambda$393/1537335544.accept')
+f(4,2990752,669,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.lambda$run$3')
+f(5,2990752,669,0,'jdk/internal/net/http/HttpClientImpl$SelectorManager.handleEvent')
+f(6,2990752,669,0,'jdk/internal/net/http/SocketTube$SocketFlowEvent.handle')
+f(7,2990752,669,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$ReadEvent.signalEvent')
+f(8,2990752,669,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.signalReadable')
+f(9,2990752,669,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(10,2990752,669,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(11,2990752,669,0,'jdk/internal/net/http/common/SequentialScheduler$SchedulableTask.run')
+f(12,2990752,669,0,'jdk/internal/net/http/SocketTube$SocketFlowTask.run')
+f(13,2990752,669,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription$$Lambda$284/793169332.run')
+f(14,2990752,669,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.read')
+f(15,2990752,660,0,'jdk/internal/net/http/Http1AsyncReceiver$Http1TubeSubscriber.onNext')
+f(16,2990752,660,0,'jdk/internal/net/http/Http1AsyncReceiver$Http1TubeSubscriber.onNext')
+f(17,2990752,660,0,'jdk/internal/net/http/Http1AsyncReceiver.asyncReceive')
+f(18,2990752,660,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(19,2990752,660,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(20,2990752,660,0,'jdk/internal/net/http/HttpClientImpl$DelegatingExecutor.execute')
+f(21,2990752,660,0,'java/util/concurrent/ThreadPoolExecutor.execute')
+f(22,2990752,660,0,'java/util/concurrent/LinkedBlockingQueue.offer')
+f(23,2990752,448,0,'java/util/concurrent/LinkedBlockingQueue.signalNotEmpty')
+f(24,2990752,448,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(25,2990752,448,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(26,2990752,448,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(27,2990752,448,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(28,2990752,448,0,'java/util/concurrent/locks/LockSupport.park')
+f(29,2990752,448,0,'jdk/internal/misc/Unsafe.park')
+f(30,2990752,448,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(23,2991200,212,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(24,2991200,212,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(25,2991200,212,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(26,2991200,212,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(27,2991200,212,0,'java/util/concurrent/locks/LockSupport.park')
+f(28,2991200,212,0,'jdk/internal/misc/Unsafe.park')
+f(29,2991200,212,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(15,2991412,9,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.resumeReadEvent')
+f(16,2991412,9,0,'jdk/internal/net/http/SocketTube.resumeEvent')
+f(17,2991412,9,1,'java.lang.Object')
+f(2,2991421,424071,1,'jdk.internal.net.http.HttpClientImpl$SelectorManager')
+f(2,3415492,2065,0,'jdk/internal/net/http/AsyncTriggerEvent.handle')
+f(3,3415492,546,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription$$Lambda$287/1687246905.run')
+f(4,3415492,546,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.handleSubscribeEvent')
+f(5,3415492,546,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(6,3415492,546,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(7,3415492,546,0,'jdk/internal/net/http/common/SequentialScheduler$SchedulableTask.run')
+f(8,3415492,546,0,'jdk/internal/net/http/SocketTube$SocketFlowTask.run')
+f(9,3415492,546,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription$$Lambda$284/793169332.run')
+f(10,3415492,546,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.read')
+f(11,3415492,546,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$InternalReadSubscription.handlePending')
+f(12,3415492,546,0,'jdk/internal/net/http/SocketTube$InternalReadPublisher$ReadSubscription.signalOnSubscribe')
+f(13,3415492,546,0,'jdk/internal/net/http/Http1AsyncReceiver$Http1TubeSubscriber.onSubscribe')
+f(14,3415492,546,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(15,3415492,546,0,'jdk/internal/net/http/common/SequentialScheduler.runOrSchedule')
+f(16,3415492,546,0,'jdk/internal/net/http/HttpClientImpl$DelegatingExecutor.execute')
+f(17,3415492,546,0,'java/util/concurrent/ThreadPoolExecutor.execute')
+f(18,3415492,546,0,'java/util/concurrent/LinkedBlockingQueue.offer')
+f(19,3415492,370,0,'java/util/concurrent/LinkedBlockingQueue.signalNotEmpty')
+f(20,3415492,370,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(21,3415492,370,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(22,3415492,370,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(23,3415492,370,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(24,3415492,370,0,'java/util/concurrent/locks/LockSupport.park')
+f(25,3415492,370,0,'jdk/internal/misc/Unsafe.park')
+f(26,3415492,370,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(19,3415862,176,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(20,3415862,176,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(21,3415862,176,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(22,3415862,176,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(23,3415862,176,0,'java/util/concurrent/locks/LockSupport.park')
+f(24,3415862,176,0,'jdk/internal/misc/Unsafe.park')
+f(25,3415862,176,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(3,3416038,1519,0,'jdk/internal/net/http/SocketTube$InternalWriteSubscriber$$Lambda$298/850948361.run')
+f(4,3416038,1519,0,'jdk/internal/net/http/SocketTube$InternalWriteSubscriber.startSubscription')
+f(5,3416038,1519,0,'jdk/internal/net/http/HttpClientImpl$DelegatingExecutor.execute')
+f(6,3416038,1519,0,'java/util/concurrent/ThreadPoolExecutor.execute')
+f(7,3416038,1519,0,'java/util/concurrent/LinkedBlockingQueue.offer')
+f(8,3416038,981,0,'java/util/concurrent/LinkedBlockingQueue.signalNotEmpty')
+f(9,3416038,981,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(10,3416038,981,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(11,3416038,981,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(12,3416038,981,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(13,3416038,981,0,'java/util/concurrent/locks/LockSupport.park')
+f(14,3416038,981,0,'jdk/internal/misc/Unsafe.park')
+f(15,3416038,981,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(8,3417019,538,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(9,3417019,538,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(10,3417019,538,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(11,3417019,538,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(12,3417019,538,0,'java/util/concurrent/locks/LockSupport.park')
+f(13,3417019,538,0,'jdk/internal/misc/Unsafe.park')
+f(14,3417019,538,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(2,3417557,26193,0,'jdk/internal/net/http/ConnectionPool.purgeExpiredConnectionsAndReturnNextDeadline')
+f(3,3417557,26193,0,'jdk/internal/net/http/ConnectionPool.purgeExpiredConnectionsAndReturnNextDeadline')
+f(4,3417557,26193,1,'jdk.internal.net.http.ConnectionPool')
+f(2,3443750,58719,0,'jdk/internal/net/http/HttpClientImpl.purgeTimeoutsAndReturnNextDeadline')
+f(3,3443750,58719,1,'jdk.internal.net.http.HttpClientImpl')
+f(2,3502469,18913,0,'sun/nio/ch/SelectorImpl.select')
+f(3,3502469,18913,0,'sun/nio/ch/SelectorImpl.lockAndDoSelect')
+f(4,3502469,18913,0,'sun/nio/ch/EPollSelectorImpl.doSelect')
+f(5,3502469,18913,0,'sun/nio/ch/EPollSelectorImpl.processEvents')
+f(6,3502469,18913,0,'sun/nio/ch/EPollSelectorImpl.clearInterrupt')
+f(7,3502469,18913,1,'java.lang.Object')
+f(2,3521382,1910,0,'sun/nio/ch/SelectorImpl.selectNow')
+f(3,3521382,1910,0,'sun/nio/ch/SelectorImpl.lockAndDoSelect')
+f(4,3521382,1910,0,'sun/nio/ch/EPollSelectorImpl.doSelect')
+f(5,3521382,1910,0,'sun/nio/ch/EPollSelectorImpl.processEvents')
+f(6,3521382,1910,0,'sun/nio/ch/EPollSelectorImpl.clearInterrupt')
+f(7,3521382,1910,1,'java.lang.Object')
+f(1,3523292,4210,0,'one/nio/server/SelectorThread.run')
+f(2,3523292,4210,0,'one/nio/net/Session.process')
+f(3,3523292,312,1,'one.nio.http.HttpSession')
+f(3,3523604,3898,0,'one/nio/http/HttpSession.processRead')
+f(4,3523604,3898,0,'one/nio/http/HttpSession.processHttpBuffer')
+f(5,3523604,3898,0,'one/nio/http/HttpSession.handleParsedRequest')
+f(6,3523604,3898,0,'ru/mail/polis/service/igorsamokhin/ServiceImpl.handleRequest')
+f(7,3523604,3898,0,'one/nio/http/HttpServer.handleRequest')
+f(8,3523604,3898,0,'RequestHandler1_entity.handleRequest')
+f(9,3523604,3898,0,'ru/mail/polis/service/igorsamokhin/ServiceImpl.entity')
+f(10,3523604,3898,0,'java/util/concurrent/ThreadPoolExecutor.execute')
+f(11,3523604,3898,0,'java/util/concurrent/LinkedBlockingQueue.offer')
+f(12,3523604,3626,0,'java/util/concurrent/LinkedBlockingQueue.signalNotEmpty')
+f(13,3523604,3626,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(14,3523604,3626,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(15,3523604,3626,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(16,3523604,3626,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(17,3523604,3626,0,'java/util/concurrent/locks/LockSupport.park')
+f(18,3523604,3626,0,'jdk/internal/misc/Unsafe.park')
+f(19,3523604,3626,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(12,3527230,272,0,'java/util/concurrent/locks/ReentrantLock.lock')
+f(13,3527230,272,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(14,3527230,272,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireQueued')
+f(15,3527230,272,0,'java/util/concurrent/locks/AbstractQueuedSynchronizer.parkAndCheckInterrupt')
+f(16,3527230,272,0,'java/util/concurrent/locks/LockSupport.park')
+f(17,3527230,272,0,'jdk/internal/misc/Unsafe.park')
+f(18,3527230,272,1,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+render();
+</script></body></html>
